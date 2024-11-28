@@ -1,0 +1,229 @@
+import re
+import sqlite3
+from collections import Counter, defaultdict
+from pymorphy3 import MorphAnalyzer
+
+
+class TextProcessor:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.tokens = []
+
+    def preprocess_text(self):
+        with open(self.file_path, encoding='utf-8') as file:
+            text = file.read().lower()
+        text = re.sub(r'[^а-яєіїґ\s-]', '', text)
+        self.tokens = text.split()[:20000]
+        return self.tokens
+
+    @staticmethod
+    def divide_into_subsamples(tokens, size=1000):
+        return [tokens[i:i + size] for i in range(0, len(tokens), size)]
+
+
+class FrequencyAnalyzer:
+    def __init__(self, subsamples, morph_analyzer, pos_translation):
+        self.subsamples = subsamples
+        self.morph = morph_analyzer
+        self.pos_translation = pos_translation
+        self.freq_dict = defaultdict(lambda: [0] * len(subsamples))
+        self.lemma_dict = defaultdict(lambda: {"freqs": [], "pos": None})
+        self.pos_dict = defaultdict(lambda: [0] * len(subsamples))
+
+    def calculate_frequencies(self):
+        for i, subsample in enumerate(self.subsamples):
+            counter = Counter(subsample)
+            for word, freq in counter.items():
+                self.freq_dict[word][i] = freq
+        return self.freq_dict
+
+    def lemmatize_frequencies(self):
+        for word, freqs in self.freq_dict.items():
+            lemma_parse = self.morph.parse(word)[0]
+            lemma = lemma_parse.normal_form
+            pos = self.pos_translation.get(lemma_parse.tag.POS, "невизначено")
+
+            if lemma in self.lemma_dict:
+                self.lemma_dict[lemma]["freqs"] = [x + y for x, y in zip(self.lemma_dict[lemma]["freqs"], freqs)]
+            else:
+                self.lemma_dict[lemma]["freqs"] = freqs
+                self.lemma_dict[lemma]["pos"] = pos
+        return self.lemma_dict
+
+    def calculate_pos_frequencies(self):
+        for i, subsample in enumerate(self.subsamples):
+            for word in subsample:
+                pos = self.morph.parse(word)[0].tag.POS
+                pos_ukr = self.pos_translation.get(pos, "невизначено")
+                if pos_ukr:
+                    self.pos_dict[pos_ukr][i] += 1
+        return self.pos_dict
+
+
+class DatabaseManager:
+    def __init__(self, db_name="frequency_dict.db"):
+        self.db_name = db_name
+
+    def create_tables(self, sample_name):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS ЧС_словоформ_{sample_name} (
+                          словоформа TEXT PRIMARY KEY,
+                          загальна_частота INTEGER,
+                          {', '.join([f'підвибірка_{i + 1} INTEGER' for i in range(20)])})''')
+
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS ЧС_лем_{sample_name} (
+                          лема TEXT PRIMARY KEY,
+                          частина_мови TEXT,
+                          загальна_частота INTEGER,
+                          {', '.join([f'підвибірка_{i + 1} INTEGER' for i in range(20)])})''')
+
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS ЧС_частин_мови_{sample_name} (
+                          частина_мови TEXT PRIMARY KEY,
+                          загальна_частота INTEGER,
+                          {', '.join([f'підвибірка_{i + 1} INTEGER' for i in range(20)])})''')
+
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS Проміжна_{sample_name} (
+                          словоформа TEXT,
+                          лема TEXT,
+                          частина_мови TEXT,
+                          загальна_частота INTEGER,
+                          {', '.join([f'підвибірка_{i + 1} INTEGER' for i in range(20)])})''')
+
+        conn.commit()
+        conn.close()
+
+    def insert_data(self, freq_dict, lemma_dict, pos_dict, sample_name):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+
+        for word, freqs in freq_dict.items():
+            cursor.execute(f"INSERT OR IGNORE INTO ЧС_словоформ_{sample_name} VALUES (?, ?, " + ", ".join("?" * 20) + ")",
+                           [word, sum(freqs)] + freqs[:20])
+
+        for lemma, data in lemma_dict.items():
+            freqs = data["freqs"]
+            pos = data["pos"]
+            cursor.execute(f"INSERT OR IGNORE INTO ЧС_лем_{sample_name} VALUES (?, ?, ?, " + ", ".join("?" * 20) + ")",
+                           [lemma, pos, sum(freqs)] + freqs[:20])
+
+        for pos, freqs in pos_dict.items():
+            cursor.execute(f"INSERT OR IGNORE INTO ЧС_частин_мови_{sample_name} VALUES (?, ?, " + ", ".join("?" * 20) + ")",
+                           [pos, sum(freqs)] + freqs[:20])
+
+        for word, freqs in freq_dict.items():
+            lemma_parse = morph.parse(word)[0]
+            lemma = lemma_parse.normal_form
+            pos = pos_translation.get(lemma_parse.tag.POS, "невизначено")
+            cursor.execute(f"INSERT INTO Проміжна_{sample_name} VALUES (?, ?, ?, ?, " + ", ".join("?" * 20) + ")",
+                           [word, lemma, pos, sum(freqs)] + freqs[:20])
+
+        conn.commit()
+        conn.close()
+
+    def search_word_info(self, word, sample_name):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+
+        query = f"SELECT словоформа, лема, частина_мови, загальна_частота FROM Проміжна_{sample_name} WHERE словоформа = ?"
+        cursor.execute(query, (word,))
+        word_info = cursor.fetchone()
+
+        conn.close()
+        return word_info
+
+    def execute_aggregate_query(self, query):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+
+        cursor.execute(query)
+        results = cursor.fetchall()
+
+        conn.close()
+        return results
+
+
+# Головний клас програми
+class FrequencyAnalysisApp:
+    def __init__(self, morph_analyzer, pos_translation, db_name="frequency_dict.db"):
+        self.morph = morph_analyzer
+        self.pos_translation = pos_translation
+        self.db_manager = DatabaseManager(db_name)
+
+    def process_sample(self, file_path, sample_name):
+        processor = TextProcessor(file_path)
+        tokens = processor.preprocess_text()
+        subsamples = processor.divide_into_subsamples(tokens)
+
+        analyzer = FrequencyAnalyzer(subsamples, self.morph, self.pos_translation)
+        freq_dict = analyzer.calculate_frequencies()
+        lemma_dict = analyzer.lemmatize_frequencies()
+        pos_dict = analyzer.calculate_pos_frequencies()
+
+        self.db_manager.create_tables(sample_name)
+        self.db_manager.insert_data(freq_dict, lemma_dict, pos_dict, sample_name)
+
+    def search_word(self, word, sample_name):
+        word_info = self.db_manager.search_word_info(word, sample_name)
+        if word_info:
+            word_form, lemma, pos, total_freq = word_info
+            print(f"Слово '{word_form}' має лему '{lemma}', частину мови '{pos}' та загальну частоту {total_freq}.")
+        else:
+            print(f"Слово '{word}' не знайдено в базі даних.")
+
+    def perform_aggregate_analysis(self, query):
+        results = self.db_manager.execute_aggregate_query(query)
+        for row in results:
+            print(row)
+
+
+if __name__ == "__main__":
+    pos_translation = {
+        "NOUN": "іменник",
+        "VERB": "дієслово",
+        "INFN": "інфінітив",
+        "ADJF": "прикметник",
+        "ADJS": "прикметник",
+        "COMP": "компаратив",
+        "NUMR": "числівник",
+        "ADVB": "прислівник",
+        "NPRO": "займенник",
+        "CONJ": "сполучник",
+        "PREP": "прийменник",
+        "PRCL": "частка",
+        "INTJ": "вигук",
+        "GRND": "дієприслівник",
+        "PRED": "предикатив",
+        "PRTS": "дієприкметник"
+    }
+    morph = MorphAnalyzer(lang='uk')
+
+    app = FrequencyAnalysisApp(morph, pos_translation)
+
+    # Обробка вибірок
+    app.process_sample("вибірка1.txt", "вибірка1")
+    app.process_sample("вибірка2.txt", "вибірка2")
+
+    # Виконання агрегуючого запиту
+    print("\nАналіз частот частин мови для вибірки1:")
+    query = '''
+    SELECT частина_мови, SUM(загальна_частота) AS сумарна_частота
+    FROM ЧС_лем_вибірка1
+    GROUP BY частина_мови;
+    '''
+    app.perform_aggregate_analysis(query)
+
+    # Пошук слова
+    while True:
+        word = input("Введіть слово для пошуку (або 'вихід'/'exit' для завершення): ").strip()
+        if word.lower() in ["вихід", "exit"]:
+            print("Завершення програми.")
+            break
+
+        sample = input("Виберіть вибірку для пошуку (вибірка1 або вибірка2): ").strip()
+        if sample not in ["вибірка1", "вибірка2"]:
+            print("Невірна вибірка. Спробуйте ще раз.")
+            continue
+
+        app.search_word(word, sample)
